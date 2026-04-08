@@ -185,7 +185,7 @@ pip install -r requirements.txt
 python -m scripts.download_sentence_transformer   # Section embedder (~90 MB)
 python -m scripts.download_cross_encoder          # Re-ranker (~87 MB)
 
-python -m scripts.train_clause_classifier --data_path # for local
+python -m scripts.train_clause_classifier             # for local clause classification (optional — requires contracts already uploaded)
 
 ```
 
@@ -291,25 +291,15 @@ subcontracting, general, other
 
 #### Step 1 — Prepare training data
 
-Create a CSV file `backend/data/clause_training_data.csv` with two columns:
+The training script reads directly from your MongoDB `fileSections` collection — no CSV needed. Every contract you upload and process through the system automatically populates this collection with labelled sections (`sectionTitle`, `content`, `clauseType`).
 
-```csv
-text,label
-"This Agreement shall commence on the Effective Date and continue for a period of one (1) year...",term_and_termination
-"All Confidential Information disclosed by either Party shall be kept strictly confidential...",confidentiality
-"Each Party shall indemnify and hold harmless the other Party from any claims...",indemnification
-```
-
-- `text`: the section content (optionally prefixed with `SectionTitle [SEP] content`)
-- `label`: one of the 20 clause types above
-- Aim for at least **50–100 examples per label** for reliable performance
+Upload and process at least a few contracts via the UI before training. The more contracts you have processed, the better the model will perform.
 
 #### Step 2 — Train the model
 
 ```bash
 cd backend
 python -m scripts.train_clause_classifier \
-    --data_path data/clause_training_data.csv \
     --output_dir models/clause_classifier \
     --base_model bert-base-uncased \
     --epochs 5 \
