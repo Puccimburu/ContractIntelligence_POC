@@ -1,24 +1,27 @@
 """
 Train the BERT clause classifier for Legal Desk Phase 1 RAG.
 
-Fine-tunes bert-base-uncased (or any HuggingFace model) on a CSV of labelled
-contract sections, then saves the model to models/clause_classifier/.
+Reads labelled sections directly from the fileSections MongoDB collection
+and fine-tunes bert-base-uncased (or any HuggingFace model) on them.
 
 Usage
 -----
     python -m scripts.train_clause_classifier \
-        --data_path data/clause_training_data.csv \
         --output_dir models/clause_classifier \
         --base_model bert-base-uncased \
         --epochs 5 \
         --batch_size 16 \
         --max_length 256
 
-Input CSV format
-----------------
-    text,label
-    "This Agreement shall commence on the Effective Date...",term_and_termination
-    "All Confidential Information disclosed by either Party...",confidentiality
+MongoDB source
+--------------
+Reads from the fileSections collection. Each document must have:
+    - sectionTitle  (str)
+    - content       (str)
+    - clauseType    (str)  — one of the 20 supported labels below
+
+Sections without a clauseType or with an unrecognised clauseType are mapped
+to 'other'.
 
 Supported labels (20 total)
 ----------------------------
@@ -36,12 +39,10 @@ Output
 """
 
 import argparse
-import os
 import pathlib
 import sys
 
 import numpy as np
-import pandas as pd
 
 CLAUSE_TYPES = [
     "definitions", "order_of_precedence", "term_and_termination",
@@ -56,35 +57,49 @@ LABEL2ID = {label: i for i, label in enumerate(CLAUSE_TYPES)}
 ID2LABEL = {i: label for i, label in enumerate(CLAUSE_TYPES)}
 
 
-def load_data(data_path: str):
-    """Load and validate the training CSV."""
-    df = pd.read_csv(data_path)
+def load_data_from_mongodb():
+    """Load and validate training data from the fileSections collection."""
+    from src.utils.connection_utils import db
+    import pandas as pd
 
-    if "text" not in df.columns or "label" not in df.columns:
+    print("Reading sections from MongoDB fileSections collection ...")
+    sections = list(db["fileSections"].find(
+        {"content": {"$exists": True}, "clauseType": {"$exists": True}},
+        {"sectionTitle": 1, "content": 1, "clauseType": 1}
+    ))
+
+    if not sections:
         sys.exit(
-            f"ERROR: CSV must have 'text' and 'label' columns. "
-            f"Found: {list(df.columns)}"
+            "ERROR: No sections found in fileSections collection. "
+            "Upload and process some contracts first."
         )
 
-    # Normalise whitespace and lowercase labels
-    df["text"] = df["text"].fillna("").str.strip()
-    df["label"] = df["label"].str.strip().str.lower()
+    df = pd.DataFrame(sections)
 
-    # Report unknown labels
+    # Build input text: "sectionTitle [SEP] content"
+    df["text"] = (
+        df["sectionTitle"].fillna("").str.strip()
+        + " [SEP] "
+        + df["content"].fillna("").str.strip()
+    )
+
+    # Normalise labels
+    df["label"] = df["clauseType"].fillna("other").str.strip().str.lower()
+
     unknown = set(df["label"].unique()) - set(CLAUSE_TYPES)
     if unknown:
-        print(f"WARNING: Unknown labels will be mapped to 'other': {unknown}")
+        print(f"WARNING: Unknown labels mapped to 'other': {unknown}")
         df.loc[df["label"].isin(unknown), "label"] = "other"
 
     df["label_id"] = df["label"].map(LABEL2ID)
+    df = df[df["text"].str.strip() != " [SEP] "]
 
-    print(f"\nLoaded {len(df)} examples across {df['label'].nunique()} classes.")
+    print(f"\nLoaded {len(df)} sections across {df['label'].nunique()} clause types.")
     print(df["label"].value_counts().to_string())
     return df
 
 
 def build_dataset(df, tokenizer, max_length: int):
-    """Tokenise the dataframe and return a HuggingFace Dataset."""
     import torch
     from torch.utils.data import Dataset
 
@@ -111,11 +126,9 @@ def build_dataset(df, tokenizer, max_length: int):
 
 
 def compute_metrics(eval_pred):
-    """Accuracy metric for the Trainer."""
     logits, labels = eval_pred
     predictions = np.argmax(logits, axis=-1)
-    accuracy = (predictions == labels).mean()
-    return {"accuracy": float(accuracy)}
+    return {"accuracy": float((predictions == labels).mean())}
 
 
 def train(args):
@@ -131,24 +144,20 @@ def train(args):
     print(f"  Clause Classifier Training")
     print(f"{'='*60}")
     print(f"  Base model  : {args.base_model}")
-    print(f"  Data path   : {args.data_path}")
     print(f"  Output dir  : {args.output_dir}")
     print(f"  Epochs      : {args.epochs}")
     print(f"  Batch size  : {args.batch_size}")
     print(f"  Max length  : {args.max_length}")
     print(f"{'='*60}\n")
 
-    # ── Load data ────────────────────────────────────────────────────────────
-    df = load_data(args.data_path)
+    df = load_data_from_mongodb()
 
-    # Train / validation split (90 / 10)
     from sklearn.model_selection import train_test_split
     train_df, val_df = train_test_split(
         df, test_size=0.1, random_state=42, stratify=df["label_id"]
     )
     print(f"\nTrain: {len(train_df)} | Validation: {len(val_df)}")
 
-    # ── Tokeniser & model ────────────────────────────────────────────────────
     print(f"\nLoading tokeniser from {args.base_model} ...")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
 
@@ -160,11 +169,9 @@ def train(args):
         label2id=LABEL2ID,
     )
 
-    # ── Datasets ─────────────────────────────────────────────────────────────
     train_dataset = build_dataset(train_df, tokenizer, args.max_length)
-    val_dataset = build_dataset(val_df, tokenizer, args.max_length)
+    val_dataset   = build_dataset(val_df,   tokenizer, args.max_length)
 
-    # ── Training arguments ───────────────────────────────────────────────────
     output_dir = pathlib.Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -182,12 +189,11 @@ def train(args):
         metric_for_best_model="accuracy",
         greater_is_better=True,
         logging_steps=10,
-        save_total_limit=2,           # keep only the 2 best checkpoints
-        report_to="none",             # disable wandb / tensorboard
-        fp16=False,                   # set True if you have a CUDA GPU
+        save_total_limit=2,
+        report_to="none",
+        fp16=False,
     )
 
-    # ── Trainer ──────────────────────────────────────────────────────────────
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -200,30 +206,22 @@ def train(args):
     print("\nStarting training ...\n")
     trainer.train()
 
-    # ── Save final model ─────────────────────────────────────────────────────
-    print(f"\nSaving final model to {output_dir} ...")
+    print(f"\nSaving model to {output_dir} ...")
     trainer.save_model(str(output_dir))
     tokenizer.save_pretrained(str(output_dir))
 
-    print("\nEvaluation on validation set:")
+    print("\nValidation results:")
     metrics = trainer.evaluate()
     for k, v in metrics.items():
         print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
     print(f"\nDone. Model saved to: {output_dir.resolve()}")
-    print(
-        "Restart the backend — it will auto-detect the new model and load it at startup."
-    )
+    print("Restart the backend — it will load the new model automatically.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train the Legal Desk clause classifier."
-    )
-    parser.add_argument(
-        "--data_path",
-        required=True,
-        help="Path to training CSV with 'text' and 'label' columns.",
+        description="Train the Legal Desk clause classifier from MongoDB fileSections."
     )
     parser.add_argument(
         "--output_dir",
@@ -245,7 +243,7 @@ def main():
         "--batch_size",
         type=int,
         default=16,
-        help="Training batch size per device (default: 16). Reduce to 8 if OOM.",
+        help="Training batch size (default: 16). Reduce to 8 if OOM.",
     )
     parser.add_argument(
         "--max_length",
@@ -254,10 +252,6 @@ def main():
         help="Max token length per input (default: 256).",
     )
     args = parser.parse_args()
-
-    if not os.path.exists(args.data_path):
-        sys.exit(f"ERROR: Data file not found: {args.data_path}")
-
     train(args)
 
 
