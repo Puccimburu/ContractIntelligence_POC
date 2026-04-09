@@ -7,7 +7,7 @@ A RAG (Retrieval-Augmented Generation) platform for legal contract analysis. Upl
 
 ## Architecture
 
-The system uses a 3-phase RAG pipeline per query:
+The system uses a 4-phase RAG pipeline per query:
 
 ```
 User Query
