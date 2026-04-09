@@ -580,44 +580,53 @@ def get_fileInfo_from_messages(conversationId, messageId):
 
 def get_fileInfo_from_conversation(conversationId):
     """
-    Retrieves structured file information from a MongoDB 'messages' collection
-    based on the given conversationId.
+    Retrieves structured file information for a conversation.
+
+    Primary path: messages.attachments (legacy / main-app pipeline).
+    Fallback path: filePages collection (CI pipeline — files uploaded via
+        POST /ci/upload are stored there directly, not in message attachments).
 
     Returns:
-        list[dict] | None: List of dicts with keys 'fileId', 'fileName', 'blobName', 
-                           or None if no attachments found.
+        list[dict] | None: List of dicts with keys 'fileId', 'fileName', 'blobName',
+                           or None if no files found by either path.
     """
     try:
-
-        # Find all messages with the given conversationId
-        # For all messages in the conversation, we will collect attachments
-        # and return a combined list of fileInfo
-        
-        messages_record = db["messages"].find(
-            {"conversationId": conversationId}
-        )
-
-        # Collect all attachments from the messages
+        # --- Primary: messages.attachments ---
+        messages_record = db["messages"].find({"conversationId": conversationId})
         all_attachments = []
         for message in messages_record:
             attachments = message.get("attachments", [])
             if isinstance(attachments, list):
                 all_attachments.extend(attachments)
 
-        if not all_attachments:
-            print(f"No valid attachments found for conversationId={conversationId}")
-            return None
+        if all_attachments:
+            return [
+                {
+                    "fileId": a.get("fileId"),
+                    "fileName": a.get("fileName"),
+                    "blobName": a.get("blobName", ""),
+                }
+                for a in all_attachments
+            ]
 
-        # Build structured file info list
-        fileInfo = [
-            {
-                "fileId": attachment.get("fileId"),
-                "fileName": attachment.get("fileName"),
-                "blobName": attachment.get("blobName")
-            }
-            for attachment in all_attachments
-        ]
-        return fileInfo
+        # --- Fallback: filePages (CI upload pipeline) ---
+        fp_records = list(db["filePages"].find(
+            {"conversationId": conversationId},
+            {"fileId": 1, "fileName": 1, "localPath": 1},
+        ))
+        if fp_records:
+            return [
+                {
+                    "fileId": r.get("fileId"),
+                    "fileName": r.get("fileName", ""),
+                    "blobName": r.get("localPath", ""),
+                }
+                for r in fp_records
+                if r.get("fileId")
+            ]
+
+        print(f"No valid attachments found for conversationId={conversationId}")
+        return None
 
     except Exception as e:
         print(f"Error in get_fileInfo_from_messages: {e}")

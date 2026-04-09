@@ -1059,27 +1059,25 @@ def _phase2_crossref(
     _PERCENTAGE_RE = re.compile(r'\d+(?:\.\d+)?\s*%')
 
     if query and _FINANCIAL_QUERY_RE.search(query):
-        # Fix 3: scope financial injection to the single highest-rank file among
-        # the seed files. This prevents simultaneous injection of conflicting rates
-        # from different hierarchy levels (e.g. Framework +3% vs SaaS 2%/month).
-        seed_file_ids_for_fin = list({s["fileId"] for s in seed_sections})
-        if seed_file_ids_for_fin:
-            # Pick the file with the highest functionalRoleRank (transaction > master)
-            best_rank = -1
-            best_file_id = seed_file_ids_for_fin[0]
-            for fid in seed_file_ids_for_fin:
-                fmeta = file_meta.get(fid, {})
-                rank = fmeta.get("functionalRoleRank", 1)
-                if rank > best_rank:
-                    best_rank = rank
-                    best_file_id = fid
-            fin_query: dict = {"conversationId": conversation_id, "fileId": best_file_id}
-        else:
-            fin_query = {"conversationId": conversation_id}
-
-        fin_sections = list(db["fileSections"].find(fin_query, limit=200))
+        # Search ALL files in the conversation for sections containing financial values.
+        # The previous behaviour (single highest-rank file only) caused fees defined in
+        # the master agreement (e.g. Clause 6.5 conversion fee table) to be missed when a
+        # Work Order was the highest-rank seed file.
+        # The LLM's specificity hierarchy (Schedule > body; transaction > master) already
+        # handles conflicting rates from different document levels, so we can safely include
+        # financial sections from the full corpus and let the LLM resolve precedence.
+        fin_sections = list(db["fileSections"].find(
+            {"conversationId": conversation_id}, limit=300
+        ))
+        # Sort by descending functionalRoleRank so higher-rank docs fill the budget first,
+        # preserving the original preference for transaction-level rates when there is a
+        # genuine conflict — but without excluding master-agreement fee schedules entirely.
+        fin_sections.sort(
+            key=lambda s: file_meta.get(s["fileId"], {}).get("functionalRoleRank", 1),
+            reverse=True,
+        )
         added_fin = 0
-        _MAX_FIN_INJECTIONS = 8
+        _MAX_FIN_INJECTIONS = 15
         for sec in fin_sections:
             if added_fin >= _MAX_FIN_INJECTIONS:
                 break
@@ -1115,7 +1113,7 @@ def _phase2_crossref(
         if added_fin:
             logger.info(
                 f"[SectionRetriever] Phase 2: financial value injection added "
-                f"{added_fin} section(s) from highest-rank file (rank={best_rank})"
+                f"{added_fin} section(s) across all files in conversation"
             )
 
     # --- Filename-hint injection ---
@@ -1207,6 +1205,71 @@ def _phase2_crossref(
                         "[SectionRetriever] Phase 2: filename-hint injection '%s' "
                         "added %d section(s) (query token match)",
                         fname, added_hint,
+                    )
+
+    # --- Organization entity injection ---
+    # When the query mentions an organization name known in entityIndex, inject all
+    # sections from every document where that organization appears.
+    # Solves "what is Eames Consulting's role?" where the company name exists in
+    # document content (and was extracted at parse time) but does NOT appear in any
+    # filename, so the filename-hint injector above never fires for it.
+    if query:
+        from src.services.entity_extractor import get_entity_summary as _get_ent_summary
+        ent_summary = _get_ent_summary(conversation_id)
+        known_orgs = {
+            k.replace("organization:", "").strip()
+            for k in ent_summary
+            if k.startswith("organization:")
+        }
+        _query_lower_org = query.lower()
+        for org_name in known_orgs:
+            if not org_name or len(org_name) < 3:
+                continue
+            # Match if any meaningful token (3+ chars) of the org name appears in the query
+            org_tokens = [t for t in re.split(r'\W+', org_name.lower()) if len(t) >= 3]
+            if not org_tokens:
+                continue
+            if not any(t in _query_lower_org for t in org_tokens):
+                continue
+            # Find all files that mention this organization via the entity index
+            from src.services.entity_extractor import find_files_by_entity as _find_by_ent
+            org_file_ids = _find_by_ent(conversation_id, org_name, entity_type="organization")
+            for fid in org_file_ids:
+                org_sections = list(db["fileSections"].find({
+                    "conversationId": conversation_id,
+                    "fileId": fid,
+                }))
+                added_org = 0
+                for sec in org_sections:
+                    key = (sec["fileId"], sec["sectionId"])
+                    if key not in seen:
+                        seen.add(key)
+                        fmeta = file_meta.get(sec["fileId"], {})
+                        expanded.append({
+                            "sectionId": sec["sectionId"],
+                            "sectionTitle": sec.get("sectionTitle", ""),
+                            "fileId": sec["fileId"],
+                            "fileName": sec.get("fileName", ""),
+                            "pageNumber": sec.get("pageNumber", 0),
+                            "content": sec.get("content", ""),
+                            "clauseType": sec.get("clauseType", "other"),
+                            "scheduleContext": sec.get("scheduleContext", ""),
+                            "riskLevel": sec.get("riskLevel", 1),
+                            "riskNote": sec.get("riskNote", ""),
+                            "effectiveDate": fmeta.get("effectiveDate"),
+                            "documentType": fmeta.get("documentType", ""),
+                            "documentRank": fmeta.get("documentRank", 1),
+                            "functionalRole": fmeta.get("functionalRole", "standalone"),
+                            "functionalRoleRank": fmeta.get("functionalRoleRank", 1),
+                            "score": 0.0,
+                            "_org_entity_injection": True,  # immune to Phase 3 pruning
+                        })
+                        added_org += 1
+                if added_org:
+                    logger.info(
+                        "[SectionRetriever] Phase 2: org-entity injection '%s' "
+                        "added %d section(s) from file %s",
+                        org_name, added_org, fid,
                     )
 
     # --- Physical address injection ---
@@ -1571,6 +1634,7 @@ def _phase3_llm_navigate(query: str, candidates: List[dict]) -> List[dict]:
             or s.get("_governing_law_injection")
             or s.get("_dispute_resolution_injection")
             or s.get("_sla_injection")
+            or s.get("_org_entity_injection")
         )
 
     always_pass = [s for s in candidates if _is_immune(s)]

@@ -79,7 +79,38 @@ def _load_model():
             _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
         except Exception:
             _tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-        _model     = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
+        _model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
+
+        # Detect and fix meta-device tensors (same issue as cross-encoder).
+        on_meta = any(p.device.type == "meta" for p in _model.parameters())
+        if on_meta:
+            import os as _os
+            import pathlib as _pathlib
+            logger.info("[ClauseClassifier] Meta-device tensors detected — materialising on CPU")
+            mp = _pathlib.Path(MODEL_PATH)
+            st = mp / "model.safetensors"
+            pt = mp / "pytorch_model.bin"
+            if st.exists():
+                from safetensors.torch import load_file as _lf
+                sd = _lf(str(st), device="cpu")
+            elif pt.exists():
+                sd = torch.load(str(pt), map_location="cpu")
+            else:
+                raise FileNotFoundError(f"No weight file in {MODEL_PATH}")
+            from transformers import AutoConfig as _AC
+            cfg = _AC.from_pretrained(MODEL_PATH)
+            cpu_m = AutoModelForSequenceClassification.from_config(cfg)
+            cpu_m = cpu_m.to_empty(device="cpu")
+            try:
+                cpu_m.load_state_dict(sd, strict=True, assign=True)
+            except TypeError:
+                own = cpu_m.state_dict()
+                for k in sd:
+                    if k in own:
+                        own[k].copy_(sd[k])
+                cpu_m.load_state_dict(own, strict=False)
+            _model = cpu_m
+
         _model.eval()
         _available = True
         logger.info("[ClauseClassifier] Model loaded (%d labels).", _model.config.num_labels)

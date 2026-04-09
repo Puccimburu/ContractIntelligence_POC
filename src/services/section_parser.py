@@ -791,7 +791,7 @@ def _classify_clause_types(sections: List[dict]) -> List[dict]:
 
     try:
         response = invoke_with_costing_evalution(prompt=prompt)
-        raw = response.content.strip()
+        raw = (response.content or "").strip()
         if "```" in raw:
             start = raw.find("[")
             end = raw.rfind("]") + 1
@@ -981,7 +981,7 @@ def _llm_fallback_parse(
 
     try:
         response = invoke_with_costing_evalution(prompt=prompt)
-        raw = response.content.strip()
+        raw = (response.content or "").strip()
         if '```' in raw:
             start = raw.find('[')
             end = raw.rfind(']') + 1

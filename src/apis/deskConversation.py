@@ -204,8 +204,25 @@ def _run_rag_background(
                 for k in entity_summary
                 if k.startswith("person:")
             }
+            known_orgs = {
+                k.replace("organization:", "").strip()
+                for k in entity_summary
+                if k.startswith("organization:")
+            }
             query_lower = query.lower()
             matched_person = next((p for p in known_persons if p and p in query_lower), None)
+
+            # Also check organizations — handles "what is Eames Consulting's role?"
+            matched_org = None
+            if not matched_person:
+                for org in known_orgs:
+                    if not org:
+                        continue
+                    org_tokens = [t for t in re.split(r'\W+', org.lower()) if len(t) >= 3]
+                    if org_tokens and any(t in query_lower for t in org_tokens):
+                        matched_org = org
+                        break
+
             if matched_person:
                 person_docs = get_documents_for_person(conversation_id, matched_person)
                 if person_docs:
@@ -218,6 +235,29 @@ def _run_rag_background(
                         f"\n\nENTITY THREAD — Documents mentioning '{matched_person}':\n"
                         + "\n".join(thread_lines)
                         + "\nThe [CURRENT] document is the most recent non-terminated transaction.\n"
+                    )
+            elif matched_org:
+                from src.services.entity_extractor import find_files_by_entity
+                org_file_ids = find_files_by_entity(conversation_id, matched_org, entity_type="organization")
+                if org_file_ids:
+                    org_pages = list(db["filePages"].find(
+                        {"conversationId": conversation_id, "fileId": {"$in": org_file_ids}},
+                        {"fileId": 1, "fileName": 1, "functionalRole": 1, "effectiveDate": 1},
+                    ))
+                    _role_order = {"master_agreement": 0, "transaction": 1, "modification": 2, "termination": 3}
+                    org_pages.sort(key=lambda x: (
+                        _role_order.get(x.get("functionalRole", "standalone"), 4),
+                        x.get("effectiveDate") or "",
+                    ))
+                    thread_lines = [
+                        f"  [{p.get('functionalRole','standalone').upper()}] {p.get('fileName','')} "
+                        f"(date: {p.get('effectiveDate') or '?'})"
+                        for p in org_pages
+                    ]
+                    entity_thread_context = (
+                        f"\n\nENTITY THREAD — Documents mentioning '{matched_org}':\n"
+                        + "\n".join(thread_lines)
+                        + "\nCross-reference ALL listed documents to determine this organization's role and obligations.\n"
                     )
         except Exception as rel_e:
             insert_logs(
