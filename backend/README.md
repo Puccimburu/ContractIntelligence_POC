@@ -7,55 +7,10 @@ A RAG (Retrieval-Augmented Generation) platform for legal contract analysis. Upl
 
 ## Architecture
 
-### Upload Pipeline
-
-Every contract is processed through this pipeline on upload:
-
-```
-File Upload (PDF / DOCX / TXT)
-    │
-    ├─ 1. Text Extraction
-    │      PyPDF / Tesseract OCR (scanned PDFs) / UnstructuredWord (DOCX)
-    │
-    ├─ 2. Section Parsing
-    │      Splits document into labelled sections (title, clauseType, content)
-    │      LLM fallback when BERT confidence < 0.7
-    │
-    ├─ 3. Embedding Generation
-    │      sentence-transformers/all-MiniLM-L6-v2 → stored in Qdrant
-    │
-    ├─ 4. Cross-Reference Extraction
-    │      Detects clause-to-clause and doc-to-doc references
-    │
-    ├─ 5. Entity Extraction
-    │      LLM extracts persons, organisations, financial terms, dates,
-    │      references, identifiers from the first pages + financial snippets
-    │      from later pages (Schedule fee tables, currency symbols).
-    │      Assigns functional role: master_agreement | transaction |
-    │      modification | termination | standalone
-    │
-    ├─ 6. Document Relationship Detection
-    │      Links master agreements → work orders / addenda / novations.
-    │      Four-layer resolution: entity refs → identifier codes →
-    │      extraction fallback → single-master fallback
-    │
-    └─ 7. Knowledge Graph Extraction
-           LLM extracts intra-clause semantic edges in batches of 20 sections:
-           CONDITIONS, SUPERSEDES, EXCEPTIONS, DEFINES, REFERENCES, PARTY_TO
-           Document-level edges mirror documentRelationships:
-           MASTER_OF, NOVATES, TERMINATES, RENEWAL_OF
-           Entity nodes deduplicated via alias normalisation
-           (e.g. "Mainstay HK" = "Mainstay Asia Ltd" = "Mainstay Asia of HK")
-```
-
-### Query Pipeline
+The system uses a 4-phase RAG pipeline per query:
 
 ```
 User Query
-    │
-    ├─ Phase 0 ── Entity Alias Expansion
-    │             Looks up graphNodes for all known aliases of entities
-    │             mentioned in the query and augments the search string
     │
     ▼
 Phase 1 ── BERT Clause Classifier
@@ -67,20 +22,21 @@ Phase 2 ── Qdrant Vector Search
            Retrieves top-N contract sections via dense embeddings
            (sentence-transformers/all-MiniLM-L6-v2)
     │
-    ├─ Graph Injection
-    │  Sections linked to Phase 2 results via CONDITIONS / SUPERSEDES /
-    │  EXCEPTIONS edges are added automatically (graph-augmented RAG)
-    │
     ▼
 Phase 3 ── Cross-Encoder Re-ranking
-           Re-scores all candidates (including graph-injected sections)
-           for relevance to the exact query
+           Re-scores retrieved sections for relevance to the exact query
            (cross-encoder/ms-marco-MiniLM-L-6-v2)
     │
     ▼
 Phase 4 ── Gemini LLM Generation
            Generates a cited, section-aware answer with follow-up suggestions
 ```
+
+Documents are processed on upload:
+- Text extraction (PyPDF / Tesseract OCR for scanned PDFs / UnstructuredWord for DOCX)
+- Section parsing (headers, clause types, cross-references)
+- Embedding generation → stored in Qdrant
+- Metadata stored in MongoDB
 
 ---
 
@@ -91,13 +47,12 @@ Phase 4 ── Gemini LLM Generation
 | Backend API | FastAPI + Uvicorn |
 | Database | MongoDB |
 | Vector Store | Qdrant |
-| LLM | Google Gemini 2.5 (flash-lite / flash / pro) |
+| LLM | Google Gemini 2.5 (flash-lite / pro) |
 | Embeddings | sentence-transformers all-MiniLM-L6-v2 |
 | Clause Classifier | Fine-tuned BERT (bert-base-uncased) |
 | Re-ranker | cross-encoder/ms-marco-MiniLM-L-6-v2 |
 | OCR | Tesseract + Poppler |
 | Frontend | React 19 + Vite + Tailwind CSS |
-| Graph Visualisation | React Flow (@xyflow/react) + Dagre auto-layout |
 
 ---
 
@@ -126,24 +81,16 @@ contract-intelligence/
 │   │   ├── main.py                     # FastAPI app + lifespan startup
 │   │   ├── apis/
 │   │   │   ├── default.py              # Health check
-│   │   │   ├── contractIntelligence.py # Upload, processing & graph endpoints
+│   │   │   ├── contractIntelligence.py # Upload & processing endpoints
 │   │   │   └── deskConversation.py     # Conversation & RAG endpoints
 │   │   ├── configs/
 │   │   │   └── config.yaml             # Base config (no secrets)
 │   │   ├── services/
-│   │   │   ├── section_parser.py       # Splits document into labelled sections
+│   │   │   ├── section_parser.py       # Splits document into sections
 │   │   │   ├── section_embedder.py     # Embeds sections → Qdrant
-│   │   │   ├── section_retriever.py    # 4-phase RAG retrieval + graph injection
+│   │   │   ├── section_retriever.py    # 3-phase RAG retrieval
 │   │   │   ├── crossref_extractor.py   # Detects cross-references between docs
-│   │   │   ├── entity_extractor.py     # Extracts entities + functional role;
-│   │   │   │                           #   scans later pages for currency symbols
-│   │   │   ├── document_relationship_service.py  # Links masters → children,
-│   │   │   │                                     #   novations, terminations,
-│   │   │   │                                     #   renewals (4-layer resolution)
-│   │   │   └── graph_extractor.py      # Builds graphNodes + graphEdges;
-│   │   │                               #   LLM clause-relationship extraction;
-│   │   │                               #   entity alias deduplication;
-│   │   │                               #   React Flow graph API
+│   │   │   └── entity_extractor.py     # Extracts named entities
 │   │   └── utils/
 │   │       ├── clause_classifier_instance.py  # BERT classifier singleton
 │   │       ├── cross_encoder_instance.py      # Re-ranker singleton
@@ -167,27 +114,10 @@ contract-intelligence/
     │   ├── App.jsx
     │   ├── api/
     │   ├── components/
-    │   │   ├── graph/
-    │   │   │   └── GraphView.jsx       # React Flow graph visualisation
-    │   │   └── Layout.jsx              # Main layout with graph panel toggle
     │   └── hooks/
     ├── package.json
     └── vite.config.js
 ```
-
----
-
-## MongoDB Collections
-
-| Collection | Description |
-|---|---|
-| `filePages` | Raw page text + metadata per file; `functionalRole` written here after entity extraction |
-| `fileSections` | Parsed sections with `clauseType`, `content`, cross-references |
-| `documentEntities` | Bag-of-entities per file: persons, orgs, financial terms, dates, references, identifiers |
-| `entityIndex` | One record per entity occurrence — used for alias lookup and cross-file matching |
-| `documentRelationships` | Resolved links between files: `master_child`, `novation`, `termination`, `renewal` |
-| `graphNodes` | Knowledge graph nodes: document, section, person, organisation, financial |
-| `graphEdges` | Knowledge graph edges with `edgeType`, `provenance` (EXTRACTED / INFERRED / AMBIGUOUS) |
 
 ---
 
@@ -212,7 +142,7 @@ QDRANT_API_KEY=                          # Leave empty for local Qdrant
 # Gemini
 GEMINI_API_KEY=your_gemini_api_key_here
 
-# Google Service Account
+# Google Service Account 
 GOOGLE_SERVICE_ACCOUNT_JSON=
 
 # OCR — Windows paths
@@ -255,8 +185,8 @@ pip install -r requirements.txt
 python -m scripts.download_sentence_transformer   # Section embedder (~90 MB)
 python -m scripts.download_cross_encoder          # Re-ranker (~87 MB)
 
-# Train clause classifier (optional — requires contracts already uploaded)
-python -m scripts.train_clause_classifier
+python -m scripts.train_clause_classifier             # for local clause classification (optional — requires contracts already uploaded)
+
 ```
 
 > The clause classifier is **optional** — if you skip it, the system falls back to LLM-based clause classification automatically. To train it, see [ML Models Setup](#ml-models-setup).
@@ -269,12 +199,6 @@ python -m scripts.train_clause_classifier
 cd frontend
 
 npm install
-```
-
-Install graph visualisation dependencies (included in package.json — run once):
-
-```bash
-npm install @xyflow/react @dagrejs/dagre
 ```
 
 Create `frontend/.env`:
@@ -349,7 +273,7 @@ This only needs to be run once. After that the model loads from disk on every st
 
 ---
 
-### 3. Clause Classifier (Phase 1)
+### 2. Clause Classifier (Phase 1)
 
 This is a fine-tuned BERT model trained to classify contract sections into 20 clause types. You need to train it yourself using your own contract data.
 
@@ -400,78 +324,6 @@ If you see `WARNING - [ClauseClassifier] Model directory not found` instead, the
 
 ---
 
-## Knowledge Graph
-
-The knowledge graph layer runs automatically on every upload. It does not require any configuration.
-
-### What the graph captures
-
-**Document-level nodes and edges**
-
-| Node type | Colour in UI | Meaning |
-|---|---|---|
-| `master_agreement` | Blue | Root/hub contract (MSA, Framework Agreement, MCA) |
-| `transaction` | Green | Work Order, SOW, PO issued under a master |
-| `modification` | Amber | Addendum, Novation, Amendment to another document |
-| `termination` | Red | Termination letter or notice |
-| `standalone` | Grey | NDA, independent contract with no parent |
-
-| Edge type | Meaning |
-|---|---|
-| `MASTER_OF` | Master agreement governs this child document |
-| `NOVATES` | Modification novates / amends the target document |
-| `TERMINATES` | Termination letter ends the target document |
-| `RENEWAL_OF` | Transaction renews a predecessor Work Order |
-| `PARTY_TO` | Person or organisation is a party to the document |
-
-**Section-level edges (LLM-extracted)**
-
-| Edge type | Meaning |
-|---|---|
-| `CONDITIONS` | This clause is conditional on the target clause |
-| `SUPERSEDES` | This clause overrides the target clause |
-| `EXCEPTIONS` | This clause carves out an exception from the target |
-| `DEFINES` | This clause defines a term used in the target |
-| `REFERENCES` | General cross-reference |
-
-### Entity alias resolution
-
-The graph deduplicates organisation names by stripping legal suffixes and normalising whitespace before matching, so entities that refer to the same party across documents are collapsed into a single node:
-
-- `Mainstay Asia Ltd` = `Mainstay Asia of Hong Kong` = `Mainstay HK` → one node
-- `AIA Investment Management Private Limited` = `AIAIM` = `AIA` → one node
-
-At query time, the retriever expands the user's query to include all known aliases before vector search, improving recall for questions that use shorthand names.
-
-### Functional role classification
-
-Role is determined in two layers:
-
-1. **Regex (section_parser)** — fast initial classification based on document title keywords
-2. **LLM override (entity_extractor)** — reads the first ~2000 chars of the document plus financial snippets from later pages; final role is authoritative
-
-A post-processing safety net corrects `master_agreement` or `standalone` to `modification` if the excerpt contains explicit addendum language ("is an Addendum to", "pursuant to the Framework Agreement", etc.).
-
-### Document relationship detection
-
-`document_relationship_service.py` runs after entity extraction and uses four layers to link child documents to their master:
-
-1. Agreement-ref entity matched against master file names
-2. Agreement-ref matched against document identifier codes (e.g. contract numbers)
-3. Extraction fallback ("Master Agreement Reference" field)
-4. Single-master fallback (if only one master exists, all unresolved children link to it)
-
-### Reprocessing existing conversations
-
-If you update the entity extraction rules or graph logic and want to apply the changes to already-uploaded contracts without re-uploading:
-
-```bash
-POST /ci/conversations/{conversation_id}/reprocess-graph
-```
-
-This re-runs entity extraction → document relationship detection → graph extraction for all files in the conversation. Requires a backend restart to pick up code changes first.
-
----
 
 ## Running the Application
 
@@ -491,6 +343,9 @@ cd frontend
 npm run dev
 ```
 
+
+
+
 App opens at `http://localhost:5173`.
 
 ---
@@ -500,16 +355,14 @@ App opens at `http://localhost:5173`.
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/health` | Health check |
-| POST | `/ci/upload` | Upload and process a contract file |
-| GET | `/ci/status/{file_id}` | Poll processing status for a file |
-| GET | `/ci/conversations/{conversation_id}/files` | List files in a conversation |
-| POST | `/ci/query` | Query contracts (RAG, streaming SSE) |
-| GET | `/ci/conversations/{conversation_id}/graph` | Get overview knowledge graph (React Flow format) |
-| GET | `/ci/files/{file_id}/graph` | Get section-level graph for one file |
-| POST | `/ci/conversations/{conversation_id}/reprocess-graph` | Re-run entity extraction + graph rebuild without re-upload |
-| POST | `/desk/conversation` | Send a message (RAG, streaming SSE) |
-| GET | `/desk/messages/{conversation_id}` | Get message history |
+| POST | `/api/contract-intelligence/upload` | Upload and process a contract file |
+| GET | `/api/contract-intelligence/files` | List uploaded files for a conversation |
+| DELETE | `/api/contract-intelligence/file/{fileId}` | Delete a file |
+| POST | `/api/desk-conversation/ask` | Ask a question (streaming SSE response) |
+| GET | `/api/desk-conversation/history` | Get conversation history |
+| DELETE | `/api/desk-conversation/conversation` | Clear a conversation |
 
 Full interactive docs available at `http://localhost:8000/docs` when the server is running.
 
 ---
+
