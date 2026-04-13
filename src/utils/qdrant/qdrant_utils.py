@@ -15,7 +15,7 @@ def get_qdrant_client():
     if _qdrant_client is None:
         QDRANT_CLUSTER_URL =CONFIG["QDRANT_CLUSTER_URL"]
         QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
-        _qdrant_client = QdrantClient(url=QDRANT_CLUSTER_URL, api_key=QDRANT_API_KEY)
+        _qdrant_client = QdrantClient(url=QDRANT_CLUSTER_URL, api_key=QDRANT_API_KEY, timeout=10)
         end = time.perf_counter()
         print(f"Qdrant client initialization completed in {end - start:.2f} seconds.")
     return _qdrant_client

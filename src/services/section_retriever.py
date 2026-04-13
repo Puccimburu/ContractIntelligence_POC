@@ -343,8 +343,24 @@ def retrieve_sections(
         # content is ALWAYS available regardless of worker timing.
         _inject_unindexed_files(conversation_id, file_meta)
 
+        # Pre-phase: Entity alias resolution via graph
+        # Expands "Mainstay HK" → ["Mainstay HK", "Mainstay Asia Ltd", "Mainstay (HK) Limited"]
+        # so all aliases are searched simultaneously rather than relying on similarity.
+        alias_augmented_query = query
+        try:
+            from src.services.graph_extractor import resolve_entity_aliases
+            aliases = resolve_entity_aliases(conversation_id, query)
+            if aliases:
+                alias_str = " OR ".join(f'"{a}"' for a in aliases[:4])
+                alias_augmented_query = f"{query} [{alias_str}]"
+                logger.info(
+                    "[SectionRetriever] Entity aliases resolved: %s", aliases[:4]
+                )
+        except Exception as alias_e:
+            logger.debug("[SectionRetriever] Alias resolution skipped: %s", alias_e)
+
         # Phase 0: Expand query into sub-queries for broader semantic coverage
-        expanded_queries = _phase0_query_expansion(query)
+        expanded_queries = _phase0_query_expansion(alias_augmented_query)
 
         # Phase 1: Semantic entry via Qdrant (one search per sub-query, merged)
         seed_sections = _phase1_multi_semantic(conversation_id, expanded_queries, top_k, file_meta)
@@ -354,8 +370,45 @@ def retrieve_sections(
             )
             return "", {}
 
-        # Phase 2: Cross-ref expansion (1 hop)
+        # Phase 2: Cross-ref expansion (1 hop) + all injections
         all_candidates = _phase2_crossref(conversation_id, seed_sections, file_meta, query)
+
+        # Phase 2 (graph): Inject sections linked via semantic edges
+        # (CONDITIONS, SUPERSEDES, EXCEPTIONS, DEFINES) from the knowledge graph.
+        # These are sections structurally connected to the seed sections that
+        # semantic search would miss — e.g. Clause 6.5 is conditioned by 6.1.
+        try:
+            import hashlib as _hl
+            def _gnid(t, *p):
+                raw = f"{t}:" + ":".join(p)
+                return _hl.md5(raw.encode()).hexdigest()[:16]
+
+            from src.services.graph_extractor import get_graph_context_for_sections
+            seed_node_ids = [
+                _gnid("section", s.get("fileId", ""), s.get("sectionId", ""))
+                for s in seed_sections
+                if s.get("fileId") and s.get("sectionId")
+            ]
+            graph_injected = get_graph_context_for_sections(
+                conversation_id, seed_node_ids
+            )
+            if graph_injected:
+                existing_keys = {
+                    (s.get("fileId"), s.get("sectionId")) for s in all_candidates
+                }
+                for sec in graph_injected:
+                    key = (sec.get("fileId"), sec.get("sectionId"))
+                    if key not in existing_keys:
+                        sec["_graph_injection"] = True
+                        sec["score"] = 0.8  # treat as high-confidence injection
+                        all_candidates.append(sec)
+                        existing_keys.add(key)
+                logger.info(
+                    "[SectionRetriever] Graph injection: +%d section(s) via semantic edges",
+                    len(graph_injected),
+                )
+        except Exception as graph_e:
+            logger.debug("[SectionRetriever] Graph injection skipped: %s", graph_e)
 
         # Phase 3: LLM navigation — prune to most relevant
         confirmed = _phase3_llm_navigate(query, all_candidates)
@@ -1635,6 +1688,7 @@ def _phase3_llm_navigate(query: str, candidates: List[dict]) -> List[dict]:
             or s.get("_dispute_resolution_injection")
             or s.get("_sla_injection")
             or s.get("_org_entity_injection")
+            or s.get("_graph_injection")   # graph-traversal injections always pass
         )
 
     always_pass = [s for s in candidates if _is_immune(s)]

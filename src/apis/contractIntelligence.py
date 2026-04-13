@@ -1,7 +1,7 @@
 """
 Contract Intelligence — standalone RAG endpoints.
 
-Replaces Node.js middleware entirely. The frontend talks directly to Python.
+
 
 Endpoints:
     POST /ci/upload          — receive file, store locally, parse + embed (background)
@@ -9,7 +9,7 @@ Endpoints:
     POST /ci/query           — full RAG pipeline, returns answer + citations
     GET  /ci/file/{fileId}   — serve raw file for PDF viewer
 
-Processing chain (identical to processAttachmentNode):
+Processing chain :
     loadDocumentTextPageWise → filePages.pageWiseText
     run_section_parser       → fileSections + fileCrossRefs
     embed_sections_to_qdrant → Qdrant contract_sections
@@ -122,6 +122,60 @@ def _process_file(file_id: str, file_name: str, conversation_id: str, local_path
             logType="information",
             bulkId=conversation_id,
         )
+
+        # Step 5 — Extract entity index (needed before graph extraction)
+        try:
+            from src.services.entity_extractor import extract_entities
+            extract_entities(file_id, conversation_id)
+            insert_logs(
+                message=f"[CI] Entity extraction complete for {file_name}",
+                logType="information",
+                bulkId=conversation_id,
+            )
+        except Exception as ent_e:
+            insert_logs(
+                message=f"[CI] Entity extraction warning for {file_name}: {ent_e}",
+                logType="warning",
+                bulkId=conversation_id,
+            )
+
+        # Step 6 — Build document relationships (master_child, novation, termination, renewal)
+        # Must run BEFORE graph extraction so MASTER_OF / NOVATES / TERMINATES edges exist.
+        try:
+            from src.services.document_relationship_service import build_document_relationships
+            build_document_relationships(conversation_id)
+            insert_logs(
+                message=f"[CI] Document relationships built for conversation {conversation_id}",
+                logType="information",
+                bulkId=conversation_id,
+            )
+        except Exception as rel_e:
+            insert_logs(
+                message=f"[CI] Document relationship warning: {rel_e}",
+                logType="warning",
+                bulkId=conversation_id,
+            )
+
+        # Step 7 — Build knowledge graph (depends on sections + entities + relationships)
+        try:
+            from src.services.graph_extractor import extract_graph
+            graph_summary = extract_graph(file_id, conversation_id)
+            insert_logs(
+                message=(
+                    f"[CI] Graph extraction complete for {file_name}: "
+                    f"{graph_summary.get('nodes', 0)} nodes, "
+                    f"{graph_summary.get('edges', 0)} edges "
+                    f"({graph_summary.get('llm_edges', 0)} LLM-extracted)"
+                ),
+                logType="information",
+                bulkId=conversation_id,
+            )
+        except Exception as graph_e:
+            insert_logs(
+                message=f"[CI] Graph extraction warning for {file_name}: {graph_e}",
+                logType="warning",
+                bulkId=conversation_id,
+            )
 
         # Mark ready
         upsertCollection("filePages", "fileId", file_id, {
@@ -613,3 +667,118 @@ def list_conversation_files(conversation_id: str):
         }
         for r in records
     ]
+
+
+# ---------------------------------------------------------------------------
+# GET /ci/conversations/{conversationId}/graph
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/conversations/{conversation_id}/graph",
+    summary="Get knowledge graph for a conversation (overview)",
+)
+def get_conversation_graph(conversation_id: str):
+    """
+    Returns the high-level knowledge graph for all documents in a conversation.
+    Nodes: documents, persons, organisations.
+    Edges: MASTER_OF, NOVATES, TERMINATES, RENEWS, PARTY_TO.
+    React-Flow compatible format.
+    """
+    try:
+        from src.services.graph_extractor import get_graph_for_conversation
+        return get_graph_for_conversation(conversation_id)
+    except Exception as e:
+        logger.error("[CI] Graph fetch failed for conversation %s: %s", conversation_id, e)
+        raise HTTPException(status_code=500, detail=f"Graph unavailable: {e}")
+
+
+# ---------------------------------------------------------------------------
+# GET /ci/files/{fileId}/graph
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/files/{file_id}/graph",
+    summary="Get clause-level knowledge graph for one document (drill-down)",
+)
+def get_file_graph(file_id: str):
+    """
+    Returns the section-level knowledge graph for a single document.
+    Nodes: document, sections (colour-coded by clauseType), parties.
+    Edges: CONTAINS, CHILD_OF, REFERENCES, CONDITIONS, SUPERSEDES, EXCEPTIONS,
+           DEFINES, OBLIGATES, PERMITS, PROHIBITS, PARTY_TO.
+    React-Flow compatible format.
+    """
+    record = db["filePages"].find_one({"fileId": file_id}, {"conversationId": 1})
+    if not record:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    conversation_id = record.get("conversationId")
+    if not conversation_id:
+        raise HTTPException(status_code=422, detail="File has no conversationId")
+
+    try:
+        from src.services.graph_extractor import get_section_graph
+        return get_section_graph(file_id, conversation_id)
+
+    except Exception as e:
+        logger.error("[CI] Section graph fetch failed for file %s: %s", file_id, e)
+        raise HTTPException(status_code=500, detail=f"Graph unavailable: {e}")
+
+
+# ---------------------------------------------------------------------------
+# POST /ci/conversations/{conversationId}/reprocess-graph
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/conversations/{conversation_id}/reprocess-graph",
+    summary="Re-run entity extraction + graph rebuild for all files in a conversation",
+)
+def reprocess_graph(conversation_id: str):
+    """
+    Re-runs entity extraction (with corrected role classification) and rebuilds
+    the knowledge graph for every file in the conversation.
+    Use this after updating the entity extractor prompt/rules without re-uploading.
+    Runs synchronously — may take 30–60 seconds for a large conversation.
+    """
+    records = list(db["filePages"].find(
+        {"conversationId": conversation_id},
+        {"fileId": 1, "fileName": 1},
+    ))
+    if not records:
+        raise HTTPException(status_code=404, detail="No files found for this conversation")
+
+    from src.services.entity_extractor import extract_entities
+    from src.services.graph_extractor import extract_graph
+    from src.services.document_relationship_service import build_document_relationships
+
+    # Step 1 — Re-run entity extraction for all files (corrects functionalRole)
+    results = []
+    for rec in records:
+        file_id = rec["fileId"]
+        file_name = rec.get("fileName", file_id)
+        try:
+            extract_entities(file_id, conversation_id)
+            results.append({"fileId": file_id, "fileName": file_name, "status": "entities_ok"})
+        except Exception as e:
+            logger.error("[CI] Reprocess entity extraction failed for %s: %s", file_name, e)
+            results.append({"fileId": file_id, "fileName": file_name, "status": "entities_error", "error": str(e)})
+
+    # Step 2 — Rebuild document relationships (must run after entity extraction)
+    try:
+        build_document_relationships(conversation_id)
+    except Exception as e:
+        logger.error("[CI] Reprocess build_document_relationships failed: %s", e)
+
+    # Step 3 — Re-run graph extraction for all files
+    final_results = []
+    for rec in records:
+        file_id = rec["fileId"]
+        file_name = rec.get("fileName", file_id)
+        try:
+            summary = extract_graph(file_id, conversation_id)
+            final_results.append({"fileId": file_id, "fileName": file_name, "status": "ok", **summary})
+        except Exception as e:
+            logger.error("[CI] Reprocess graph failed for %s: %s", file_name, e)
+            final_results.append({"fileId": file_id, "fileName": file_name, "status": "graph_error", "error": str(e)})
+
+    return {"reprocessed": len(final_results), "results": final_results}

@@ -223,28 +223,61 @@ def _find_file_by_name_fragment(files: List[Dict], fragment: str) -> Optional[Di
 # Relationship detectors
 # ---------------------------------------------------------------------------
 
+def _get_identifier_keys_for_file(file_id: str) -> List[str]:
+    """Return all identifier values (normalized) from documentEntities for a file."""
+    doc = db["documentEntities"].find_one({"fileId": file_id}, {"identifiers": 1})
+    if not doc:
+        return []
+    result = []
+    for ident in doc.get("identifiers", []):
+        v = (ident.get("value") or "").strip()
+        if v:
+            result.append(re.sub(r'[^a-z0-9]', '', v.lower()))
+    return result
+
+
+def _find_master_by_identifier(masters: List[Dict], ref_text: str) -> Optional[Dict]:
+    """
+    Try to resolve a master by matching ref_text against identifier values stored
+    in documentEntities. Handles contract reference codes like "Aston-22-7464" that
+    don't appear in file names but do appear as document identifiers.
+    """
+    normalized_ref = re.sub(r'[^a-z0-9]', '', ref_text.lower())
+    if not normalized_ref or len(normalized_ref) < 4:
+        return None
+    for master in masters:
+        for ik in _get_identifier_keys_for_file(master["fileId"]):
+            if normalized_ref in ik or ik in normalized_ref:
+                return master
+    return None
+
+
 def _detect_master_child(conversation_id: str, files: List[Dict]) -> None:
     """
-    Link every transaction document (Work Order / SOW / PO) to its master.
+    Link every transaction and modification (addendum) document to its master agreement.
 
-    Detection strategy — schema-agnostic, three layers:
-    1. Entity index: look for agreement_ref entities in the transaction doc that
-       match a master_agreement file name.
-    2. Extraction fallback: "Master Agreement Reference" prompt value if present.
-    3. Uniqueness fallback: if only one master_agreement exists, link all transactions to it.
+    Covers:
+    - Work Orders / SOWs / POs (transaction role)
+    - Addenda / SaaS Schedules / Amendments (modification role) that depend on a master
+
+    Detection strategy — four layers:
+    1. Entity index: agreement_ref entities matched against master file names.
+    2. Identifier match: agreement_ref matched against document identifier codes stored
+       in documentEntities (e.g. contract numbers like "Aston-22-7464").
+    3. Extraction fallback: "Master Agreement Reference" prompt value.
+    4. Uniqueness fallback: if only one master_agreement exists, link all
+       unresolved transactions/modifications to it.
     """
     masters = [f for f in files if _functional_role(f) == "master_agreement"]
-    transactions = [f for f in files if _functional_role(f) == "transaction"]
+    dependents = [f for f in files if _functional_role(f) in ("transaction", "modification")]
 
-    if not masters or not transactions:
+    if not masters or not dependents:
         return
 
-    file_map = {f["fileId"]: f for f in files}
-
-    for tx in transactions:
+    for tx in dependents:
         target = None
 
-        # Layer 1: entity refs
+        # Layer 1: entity refs matched against file name
         refs = _entity_refs_for_file(tx["fileId"])
         for ref_text in refs:
             candidate = _find_file_by_name_fragment(masters, ref_text)
@@ -252,13 +285,22 @@ def _detect_master_child(conversation_id: str, files: List[Dict]) -> None:
                 target = candidate
                 break
 
-        # Layer 2: extraction fallback
+        # Layer 2: entity refs matched against document identifier codes
+        if not target:
+            for ref_text in refs:
+                candidate = _find_master_by_identifier(masters, ref_text)
+                if candidate:
+                    target = candidate
+                    break
+
+        # Layer 3: extraction fallback
         if not target:
             ref_text = _get_extraction_value(tx["fileId"], "Master Agreement Reference") or ""
             if ref_text:
-                target = _find_file_by_name_fragment(masters, ref_text)
+                target = _find_file_by_name_fragment(masters, ref_text) or \
+                         _find_master_by_identifier(masters, ref_text)
 
-        # Layer 3: single master fallback
+        # Layer 4: single master fallback
         if not target and len(masters) == 1:
             target = masters[0]
 
@@ -270,7 +312,7 @@ def _detect_master_child(conversation_id: str, files: List[Dict]) -> None:
             "fromDocumentType": tx.get("documentType") or _functional_role(tx),
             "toDocumentType": target.get("documentType", "master_agreement") if target else "master_agreement",
             "detail": (
-                f"{tx.get('fileName','transaction')} is issued under "
+                f"{tx.get('fileName','document')} is issued under "
                 f"{target.get('fileName','[unresolved master]') if target else '[unresolved master]'}"
             ),
             "resolved": target is not None,
@@ -293,6 +335,17 @@ def _detect_novation_links(conversation_id: str, files: List[Dict]) -> None:
     modifications = [f for f in files if _functional_role(f) == "modification"]
 
     for mod in modifications:
+        # Skip modifications that already have a resolved master_child link —
+        # those are addenda handled by _detect_master_child (e.g. SaaS Agreement).
+        already_linked = db[_COLL].find_one({
+            "conversationId": conversation_id,
+            "fromFileId": mod["fileId"],
+            "relationshipType": "master_child",
+            "resolved": True,
+        })
+        if already_linked:
+            continue
+
         linked_any = False
 
         # Layer 1: entity agreement refs

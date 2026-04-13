@@ -65,7 +65,7 @@ class _CrossEncoder:
             logger.info("[CrossEncoder] Meta-device tensors detected — materialising on CPU")
             # Build a fresh, uninitialized CPU model (no meta tensors).
             config = AutoConfig.from_pretrained(path)
-            cpu_model = AutoModelForSequenceClassification(config)
+            cpu_model = AutoModelForSequenceClassification.from_config(config)
             cpu_model = cpu_model.to_empty(device="cpu")
             # Load actual weights from disk and assign into the empty model.
             sd = _load_state_dict_cpu(path)
@@ -89,9 +89,13 @@ class _CrossEncoder:
         all_scores = []
         for i in range(0, len(pairs), batch_size):
             batch = pairs[i : i + batch_size]
+            # Guard: replace empty strings with a single space so the tokenizer
+            # never receives an empty sequence (causes "index out of range in self")
+            queries = [p[0] if p[0] and p[0].strip() else " " for p in batch]
+            passages = [p[1] if p[1] and p[1].strip() else " " for p in batch]
             inputs = self.tokenizer(
-                [p[0] for p in batch],
-                [p[1] for p in batch],
+                queries,
+                passages,
                 truncation=True,
                 max_length=self.max_length,
                 padding=True,
@@ -99,7 +103,12 @@ class _CrossEncoder:
             )
             with torch.no_grad():
                 logits = self.model(**inputs).logits
-            all_scores.extend(logits.squeeze(-1).tolist())
+            scores = logits.squeeze(-1)
+            # squeeze(-1) leaves shape [batch] when num_labels==1; if the model
+            # returns multi-label logits take the first (relevance) column.
+            if scores.dim() > 1:
+                scores = scores[:, 0]
+            all_scores.extend(scores.tolist())
         return all_scores
 
 
