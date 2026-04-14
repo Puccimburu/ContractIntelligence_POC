@@ -1701,11 +1701,21 @@ def _phase3_llm_navigate(query: str, candidates: List[dict]) -> List[dict]:
     # document version survive (e.g. fee tracking across 3 Work Orders).
     nav_limit = 25 if _COMPARISON_QUERY_RE.search(query) else 20
 
+    def _sanitize(text: str) -> str:
+        """Remove null bytes and non-printable control characters from PDF-extracted text.
+        These trip up the HuggingFace tokenizer with 'index out of range in self'."""
+        import unicodedata
+        # Replace null bytes and ASCII control chars (except tab/newline) with space
+        cleaned = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]', ' ', text)
+        # Normalise to NFC to avoid decomposed Unicode edge cases
+        cleaned = unicodedata.normalize('NFC', cleaned)
+        return cleaned.strip()
+
     def _section_text(s: dict) -> str:
         """Build the passage text the cross-encoder scores against the query."""
-        title = s.get("sectionTitle", "").strip()
+        title = _sanitize(s.get("sectionTitle", ""))
         ct = s.get("clauseType", "")
-        content = s.get("content", "").strip().replace("\n", " ")[:400]
+        content = _sanitize(s.get("content", "")).replace("\n", " ")[:400]
         parts = []
         if title:
             parts.append(title)
@@ -1713,7 +1723,7 @@ def _phase3_llm_navigate(query: str, candidates: List[dict]) -> List[dict]:
             parts.append(f"[{ct}]")
         if content:
             parts.append(content)
-        return " | ".join(parts) if parts else content
+        return " | ".join(parts) if parts else (content or " ")
 
     try:
         from src.utils.cross_encoder_instance import get_cross_encoder

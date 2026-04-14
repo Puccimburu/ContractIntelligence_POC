@@ -319,7 +319,12 @@ def _run_rag_background(
             )
 
         # --- Build prompt (identical to askAttachmentsNode) ---
-        prompt_context = f"""Here are the contents of the attached files:
+        from datetime import datetime as _dt
+        _today = _dt.now().strftime("%B %d, %Y")
+
+        prompt_context = f"""Today's date: {_today}
+
+Here are the contents of the attached files:
 {relevant_context}
 {relationship_context}{entity_thread_context}{conversation_history}
 Based on the above, please answer the following question:
@@ -453,10 +458,33 @@ CRITICAL INSTRUCTIONS FOR COMPREHENSIVE, DETAILED RESPONSES:
    • Example: "The SLA defines 99.99% availability (Source: SaaS Agreement Page 12, Section 11.3)"
    • If comparing multiple documents, create a table showing differences WITH page references
 
-6. **CREATE COMPARISON TABLES** when appropriate to show:
+6b. **CREATE COMPARISON TABLES** when appropriate to show:
    • What different documents cover
    • Service levels vs. actual metrics
    • Framework Agreement vs. SOW vs. SaaS Agreement
+
+7. **TEMPORAL STATUS CHECK** — Today's date is {_today}. For EVERY agreement, work order,
+   or engagement period found in the documents:
+   • Compare its expiry / end date to today and state explicitly: ACTIVE, LAPSED, or RENEWED
+   • If lapsed with no documented successor: flag "⚠️ ENGAGEMENT LAPSED — no active instrument
+     found as of {_today}"
+   • For tiered schedules tied to tenure (e.g. fee waivers after N months): calculate elapsed time
+     from commencement to today and state whether the threshold has been crossed
+
+8. **DRAW ANALYTICAL CONCLUSIONS** — Do not stop at reporting facts. After extraction:
+   • Apply fee/waiver thresholds: if extracted tenure ≥ threshold stated in the document,
+     explicitly conclude whether the benefit IS or IS NOT triggered (e.g. "conversion fee waived")
+   • Apply novation logic: state who holds obligations TODAY, not just at signing
+   • Apply renewal logic: if the latest WO has lapsed and no successor exists, conclude the
+     engagement has ended and flag the commercial risk
+
+9. **REQUIRED DOCUMENTS CHECK** — If any agreement references a secondary document that
+   must be executed (Deed Poll, Data Collection Statement, IP Assignment, Side Letter, etc.):
+   • Check whether that document appears among the provided sources by name
+   • If present: confirm and cite it
+   • If absent: flag "⚠️ [Document name] is required by [clause] but is NOT present in the
+     document set — existence cannot be confirmed from available evidence"
+   • Do NOT conclude it was never signed — only note it is not in the current set
 
 RETURN FORMAT - Return in JSON using the EXPERT AUDIT TRAIL structure:
 ```json

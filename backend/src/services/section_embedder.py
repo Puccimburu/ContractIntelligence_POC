@@ -149,6 +149,25 @@ def embed_sections_to_qdrant(file_id: str, conversation_id: str) -> int:
         for i in range(0, len(points), 25):
             _upsert_batch(points[i:i + 25])
 
+        # Verify Qdrant actually persisted the points before marking as embedded.
+        # Transient connectivity issues can cause the HTTP request to appear to
+        # succeed (200 OK) while data is never written. Catching it here prevents
+        # sections_embedded=True being set on a conversation with no queryable data.
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+        verify = client.count(
+            collection_name=SECTION_COLLECTION,
+            count_filter=Filter(must=[
+                FieldCondition(key="fileId", match=MatchValue(value=file_id))
+            ]),
+            exact=True,
+        )
+        if verify.count == 0:
+            logger.error(
+                f"[SectionEmbedder] Upsert returned OK but Qdrant count=0 for "
+                f"fileId={file_id}. sections_embedded NOT set — will retry on next request."
+            )
+            return 0
+
         upsertCollection("filePages", "fileId", file_id, {"sections_embedded": True})
 
         insert_logs(

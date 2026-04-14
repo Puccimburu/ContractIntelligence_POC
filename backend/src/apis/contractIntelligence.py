@@ -177,10 +177,11 @@ def _process_file(file_id: str, file_name: str, conversation_id: str, local_path
                 bulkId=conversation_id,
             )
 
-        # Mark ready
+        # Mark ready — sections_embedded is set by embed_sections_to_qdrant only
+        # after Qdrant confirms the write succeeded. Do NOT set it here or it will
+        # mask a silent upsert failure and prevent any retry.
         upsertCollection("filePages", "fileId", file_id, {
             "processing_status": "ready",
-            "sections_embedded": True,
         })
         upsertCollection("files", "fileId", file_id, {"status": "Processed"})
 
@@ -481,7 +482,12 @@ def query_contracts(body: QueryRequest):
         )
 
     # --- Build answer prompt (identical to askAttachmentsNode) ---
-    prompt_context = f"""Here are the contents of the attached files:
+    from datetime import datetime
+    _today = datetime.now().strftime("%B %d, %Y")
+
+    prompt_context = f"""Today's date: {_today}
+
+Here are the contents of the attached files:
 {relevant_context}
 {relationship_context}{entity_thread_context}
 Based on the above, please answer the following question:
@@ -534,10 +540,32 @@ CRITICAL INSTRUCTIONS FOR COMPREHENSIVE, DETAILED RESPONSES:
    • Reference ACTUAL numbers, percentages, and timeframes
    • **ALWAYS cite page numbers** using the [Source X: filename.pdf, Page Y] markers
 
+7. **TEMPORAL STATUS CHECK** — Today's date is {_today}. For EVERY agreement, work order,
+   or engagement period found in the documents:
+   • Compare its expiry / end date to today and state: ACTIVE, LAPSED, or RENEWED
+   • If lapsed with no documented successor: flag "⚠️ ENGAGEMENT LAPSED — no active instrument found as of {_today}"
+   • For tiered schedules tied to tenure (e.g. fee waivers after N months): calculate elapsed time
+     from commencement to today and state whether the threshold has been crossed
+
+8. **DRAW ANALYTICAL CONCLUSIONS** — Do not stop at reporting facts. After extraction:
+   • Apply fee/waiver thresholds: if extracted tenure ≥ threshold stated in the document,
+     explicitly conclude the benefit IS or IS NOT triggered (e.g. "conversion fee waived")
+   • Apply novation logic: state who holds obligations TODAY, not just at signing
+   • Apply renewal logic: if the latest WO has lapsed and no WO4 exists, conclude the
+     engagement has ended and flag the commercial risk
+
+9. **REQUIRED DOCUMENTS CHECK** — If any agreement references a secondary document that
+   must be executed (Deed Poll, Data Collection Statement, IP Assignment, Side Letter, etc.):
+   • Check whether that document appears among the provided sources by name
+   • If present: confirm and cite it
+   • If absent: flag "⚠️ [Document name] is required by [clause] but is NOT present in the
+     document set — existence cannot be confirmed from available evidence"
+   • Do NOT conclude it was never signed — only note it is not in the current set
+
 RETURN FORMAT - Return in JSON:
 ```json
 {{
-  "answer": "Structure your answer exactly as a senior partner briefing a client:\\n\\n[OPEN with Risk Flags if ANY ⚠ sources are in context]\\n\\n---\\n\\n## Current Position\\n*The governing rule as it stands today.*\\n\\n---\\n\\n## Full Extraction\\n*Every specific number, percentage, timeframe, and qualifier found.*\\n\\n---\\n\\n## Expert Observations\\n*What a 30-year partner would flag — gaps, risks, market deviations.*\\n\\n---\\n\\n## Summary Table\\n\\n| Component | Current Rule | Source | Effective Date | Risk |\\n|-----------|-------------|--------|----------------|------|",
+  "answer": "Structure your answer exactly as a senior partner briefing a client:\\n\\n[OPEN with Risk Flags if ANY ⚠ sources are in context]\\n\\n---\\n\\n## Current Position\\n*The governing rule as it stands today ({_today}). Include ACTIVE / LAPSED / RENEWED status for every instrument.*\\n\\n---\\n\\n## Full Extraction\\n*Every specific number, percentage, timeframe, and qualifier found.*\\n\\n---\\n\\n## Analytical Conclusions\\n*Logical inferences drawn from the extracted facts: thresholds crossed, fees waived, engagements lapsed, obligations transferred.*\\n\\n---\\n\\n## Expert Observations\\n*What a 30-year partner would flag — gaps, risks, market deviations, required documents not in set.*\\n\\n---\\n\\n## Summary Table\\n\\n| Component | Current Rule | Source | Status as of {_today} | Risk |\\n|-----------|-------------|--------|----------------------|------|",
   "citations": [
     {{
       "sourceIndex": 1,
@@ -782,3 +810,48 @@ def reprocess_graph(conversation_id: str):
             final_results.append({"fileId": file_id, "fileName": file_name, "status": "graph_error", "error": str(e)})
 
     return {"reprocessed": len(final_results), "results": final_results}
+
+
+# ---------------------------------------------------------------------------
+# POST /ci/conversations/{conversationId}/reembed
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/conversations/{conversation_id}/reembed",
+    summary="Re-embed all contract sections into Qdrant for a conversation",
+)
+def reembed_conversation(conversation_id: str):
+    """
+    Re-runs section embedding into Qdrant for every file in the conversation.
+    Use this when Qdrant sections are missing (system fell back to FULL DOCS mode
+    on every query). Safe to call multiple times — uses upsert so no duplicates.
+
+    Returns per-file counts so you can confirm success.
+    """
+    records = list(db["filePages"].find(
+        {"conversationId": conversation_id},
+        {"fileId": 1, "fileName": 1},
+    ))
+    if not records:
+        raise HTTPException(status_code=404, detail="No files found for this conversation")
+
+    from src.services.section_embedder import embed_sections_to_qdrant
+
+    results = []
+    total = 0
+    for rec in records:
+        file_id = rec["fileId"]
+        file_name = rec.get("fileName", file_id)
+        try:
+            n = embed_sections_to_qdrant(file_id, conversation_id)
+            total += n
+            results.append({"fileId": file_id, "fileName": file_name, "sections": n, "status": "ok"})
+        except Exception as e:
+            logger.error("[CI] Reembed failed for %s: %s", file_name, e)
+            results.append({"fileId": file_id, "fileName": file_name, "sections": 0, "status": "error", "error": str(e)})
+
+    return {
+        "conversationId": conversation_id,
+        "totalSectionsEmbedded": total,
+        "files": results,
+    }
